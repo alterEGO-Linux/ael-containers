@@ -1,0 +1,43 @@
+# =============================================================================
+# INFO
+# =============================================================================
+# [/ael-containers/configs/dvwa.toml]
+# 
+# Author      : Pascal Malouin (https://github.com/alterEGO-Linux)
+# Created     : 2026-09-30 18:27:49 UTC
+# Updated     : 2026-09-30 18:27:49 UTC
+# Description : dvwa-on-ael
+#
+# ---( IMPORTANT )-------------------------------------------------------------
+#
+# All configuration files in $HOME/.local/share/ael-containers/ are subject to
+# be overwritten by any updates.
+# Copy this file to $HOME/.config/ael-containers/ if you wish to modify it.
+# -----------------------------------------------------------------------------
+
+[meta]
+name = "DVWA"
+description = "Damn Vulnerable Web Application running as an AEL container."
+
+[container]
+name = "dvwa-on-ael"
+image = "vulnerables/web-dvwa"
+restart = "unless-stopped"
+
+[[container.ports]]
+host = 81
+container = 80
+
+[open]
+type = "browser"
+url = "http://localhost:81"
+wait_for_health = true
+
+[health]
+type = "http"
+url = "http://localhost:81"
+timeout = 60
+interval = 0.5
+
+[shell]
+command = ["/bin/bash"]

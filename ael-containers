@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+# =============================================================================
+# INFO
+# =============================================================================
+# [/ael-containers/ael-containers]
+# 
+# Author      : Pascal Malouin (https://github.com/alterEGO-Linux)
+# Created     : 2026-09-30 18:17:38 UTC
+# Updated     : 2026-09-30 18:17:38 UTC
+# Description : AEL//Containers core.
+# -----------------------------------------------------------------------------
+
+"""AEL//Containers - generic TOML-driven Docker container runner."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+def fatal(msg: str, code: int = 1) -> None:
+    print(f"[!] {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(cmd: list[str], *, capture: bool = True, check: bool = False, cwd: Path | None = None):
+    return subprocess.run(cmd, text=True, capture_output=capture, check=check, cwd=cwd)
+
+
+def require(name: str) -> None:
+    if shutil.which(name) is None:
+        fatal(f"Required command not found: {name}")
+
+
+def expand(value: str) -> str:
+    return os.path.expandvars(os.path.expanduser(value))
+
+
+class AELContainer:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path.expanduser().resolve()
+        if not self.config_path.is_file():
+            fatal(f"Config not found: {self.config_path}")
+        with self.config_path.open("rb") as f:
+            self.cfg: dict[str, Any] = tomllib.load(f)
+
+        self.meta = self.cfg.get("meta", {})
+        self.container = self.cfg.get("container", {})
+        self.build = self.cfg.get("build", {})
+        self.name = self.container.get("name")
+        if not self.name:
+            fatal("Missing [container].name")
+        self.image = self.container.get("image") or self.build.get("tag")
+        if not self.image:
+            fatal("Missing [container].image or [build].tag")
+
+    def ensure_docker(self) -> None:
+        require("docker")
+        if run(["docker", "info"]).returncode != 0:
+            fatal("Docker is not running")
+
+    def exists(self) -> bool:
+        return run(["docker", "container", "inspect", self.name]).returncode == 0
+
+    def running(self) -> bool:
+        r = run(["docker", "inspect", "-f", "{{.State.Running}}", self.name])
+        return r.returncode == 0 and r.stdout.strip() == "true"
+
+    def image_exists(self) -> bool:
+        return run(["docker", "image", "inspect", self.image]).returncode == 0
+
+    def build_dir(self) -> Path:
+        base = Path(expand(self.build.get("workdir", "${XDG_CACHE_HOME:-~/.cache}/ael/containers")))
+        # ${VAR:-default} is shell syntax, not expandvars; use a sane fallback.
+        if "${XDG_CACHE_HOME:-" in str(base):
+            base = Path(os.getenv("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "ael" / "containers"
+        return base / self.name
+
+    def write_build_files(self) -> Path:
+        d = self.build_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        for spec in self.build.get("files", []):
+            rel = Path(spec["path"])
+            if rel.is_absolute() or ".." in rel.parts:
+                fatal(f"Unsafe build file path: {rel}")
+            p = d / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(spec.get("content", ""), encoding="utf-8")
+            if "mode" in spec:
+                p.chmod(int(str(spec["mode"]), 8))
+        return d
+
+    def install(self) -> None:
+        self.ensure_docker()
+        if self.build:
+            d = self.write_build_files()
+            dockerfile = self.build.get("dockerfile", "Dockerfile")
+            cmd = ["docker", "build", "-f", str(d / dockerfile), "-t", self.image]
+            for key, value in self.build.get("args", {}).items():
+                cmd += ["--build-arg", f"{key}={value}"]
+            cmd.append(str(d))
+            print(f"[*] Building {self.image}")
+            subprocess.run(cmd, check=True)
+        else:
+            print(f"[*] Pulling {self.image}")
+            subprocess.run(["docker", "pull", self.image], check=True)
+        print(f"[+] Installed: {self.image}")
+
+    def create(self) -> None:
+        if self.exists():
+            return
+        if not self.image_exists():
+            self.install()
+
+        cmd = ["docker", "create", "--name", self.name]
+        if hostname := self.container.get("hostname"):
+            cmd += ["--hostname", hostname]
+        if restart := self.container.get("restart"):
+            cmd += ["--restart", restart]
+        if user := self.container.get("user"):
+            cmd += ["--user", str(user)]
+        if workdir := self.container.get("workdir"):
+            cmd += ["--workdir", str(workdir)]
+
+        for port in self.container.get("ports", []):
+            host_ip = port.get("host_ip")
+            lhs = f"{host_ip}:" if host_ip else ""
+            lhs += str(port["host"])
+            cmd += ["-p", f"{lhs}:{port['container']}"]
+
+        for volume in self.container.get("volumes", []):
+            host = expand(volume["host"])
+            mode = volume.get("mode", "rw")
+            cmd += ["-v", f"{host}:{volume['container']}:{mode}"]
+
+        for key, value in self.container.get("environment", {}).items():
+            cmd += ["-e", f"{key}={expand(str(value))}"]
+
+        for cap in self.container.get("cap_add", []):
+            cmd += ["--cap-add", cap]
+
+        if self.container.get("privileged", False):
+            cmd.append("--privileged")
+
+        cmd.append(self.image)
+        cmd += [str(x) for x in self.container.get("command", [])]
+        print(f"[*] Creating {self.name}")
+        subprocess.run(cmd, check=True)
+
+    def start(self) -> None:
+        self.ensure_docker()
+        self.create()
+        if self.running():
+            print(f"[=] {self.name} is already running")
+            return
+        subprocess.run(["docker", "start", self.name], check=True)
+        print(f"[+] Started: {self.name}")
+
+    def stop(self) -> None:
+        self.ensure_docker()
+        if not self.exists():
+            print(f"[=] {self.name} does not exist")
+            return
+        if not self.running():
+            print(f"[=] {self.name} is already stopped")
+            return
+        subprocess.run(["docker", "stop", self.name], check=True)
+        print(f"[+] Stopped: {self.name}")
+
+    def restart(self) -> None:
+        self.ensure_docker()
+        if not self.exists():
+            self.start()
+            return
+        subprocess.run(["docker", "restart", self.name], check=True)
+        print(f"[+] Restarted: {self.name}")
+
+    def status(self) -> None:
+        self.ensure_docker()
+        if not self.exists():
+            print(f"{self.name}: not created")
+        elif self.running():
+            print(f"{self.name}: running")
+        else:
+            print(f"{self.name}: stopped")
+
+    def logs(self, follow: bool = False) -> None:
+        self.ensure_docker()
+        if not self.exists():
+            fatal(f"Container does not exist: {self.name}")
+        cmd = ["docker", "logs"]
+        if follow:
+            cmd.append("-f")
+        cmd.append(self.name)
+        subprocess.run(cmd)
+
+    def shell(self) -> None:
+        self.start()
+        shell = self.cfg.get("shell", {})
+        command = shell.get("command", ["/bin/sh"])
+        if isinstance(command, str):
+            command = shlex.split(command)
+        cmd = ["docker", "exec", "-it"]
+        if user := shell.get("user"):
+            cmd += ["--user", str(user)]
+        cmd += [self.name, *command]
+        os.execvp(cmd[0], cmd)
+
+    def wait_health(self) -> bool:
+        health = self.cfg.get("health", {})
+        kind = health.get("type", "container")
+        timeout = float(health.get("timeout", 30))
+        interval = float(health.get("interval", 0.5))
+        deadline = time.monotonic() + timeout
+        last_error = ""
+        while time.monotonic() < deadline:
+            try:
+                if kind == "container":
+                    return self.running()
+                if kind == "http":
+                    with urllib.request.urlopen(health["url"], timeout=min(2, interval + 1)) as r:
+                        if 200 <= r.status < 500:
+                            return True
+                elif kind == "tcp":
+                    with socket.create_connection((health.get("host", "127.0.0.1"), int(health["port"])), timeout=2):
+                        return True
+                elif kind == "command":
+                    command = health["command"]
+                    if isinstance(command, str):
+                        command = shlex.split(command)
+                    if run([expand(str(x)) for x in command]).returncode == 0:
+                        return True
+                else:
+                    fatal(f"Unknown health type: {kind}")
+            except Exception as exc:
+                last_error = str(exc)
+            time.sleep(interval)
+        if last_error:
+            print(f"[!] Last health error: {last_error}", file=sys.stderr)
+        return False
+
+    def health(self) -> None:
+        self.ensure_docker()
+        ok = self.wait_health()
+        print(f"{self.name}: {'healthy' if ok else 'unhealthy'}")
+        if not ok:
+            raise SystemExit(1)
+
+    def open(self) -> None:
+        self.start()
+        opener = self.cfg.get("open")
+        if not opener:
+            fatal("No [open] section configured")
+        if opener.get("wait_for_health", True):
+            print("[*] Waiting for container health")
+            if not self.wait_health():
+                fatal("Container did not become healthy")
+        kind = opener.get("type", "browser")
+        if kind == "browser":
+            url = opener["url"]
+            command = os.getenv("BROWSER") or opener.get("command") or "xdg-open"
+            require(shlex.split(command)[0])
+            subprocess.Popen([*shlex.split(command), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif kind == "command":
+            command = opener["command"]
+            if isinstance(command, str):
+                command = shlex.split(command)
+            command = [expand(str(x)) for x in command]
+            require(command[0])
+            subprocess.Popen(command)
+        else:
+            fatal(f"Unknown open type: {kind}")
+        print(f"[+] Opened: {self.meta.get('name', self.name)}")
+
+    def remove(self) -> None:
+        self.ensure_docker()
+        if not self.exists():
+            print(f"[=] {self.name} does not exist")
+            return
+        subprocess.run(["docker", "rm", "-f", self.name], check=True)
+        print(f"[+] Removed container: {self.name}")
+
+    def uninstall(self) -> None:
+        self.ensure_docker()
+        self.remove()
+        if self.image_exists():
+            subprocess.run(["docker", "image", "rm", self.image], check=True)
+            print(f"[+] Removed image: {self.image}")
+
+
+
+ACTIONS = [
+    "start", "stop", "restart", "status", "open", "shell", "logs",
+    "install", "uninstall", "remove", "health",
+]
+
+
+def private_config_home() -> Path:
+    """User-owned AEL//Containers definitions."""
+    xdg = os.getenv("XDG_CONFIG_HOME")
+    base = Path(expand(xdg)) if xdg else Path.home() / ".config"
+    return base / "ael-containers"
+
+
+def global_config_home() -> Path:
+    """AEL-owned AEL//Containers catalog."""
+    xdg = os.getenv("XDG_DATA_HOME")
+    base = Path(expand(xdg)) if xdg else Path.home() / ".local" / "share"
+    return base / "ael-containers"
+
+
+def _config_path(home: Path, name: str) -> Path:
+    filename = name if name.endswith(".toml") else f"{name}.toml"
+    return home / filename
+
+
+def resolve_config(name: str) -> Path:
+    """
+    Resolve a container definition.
+
+    private/<name> -> XDG_CONFIG_HOME/ael-containers/<name>.toml
+    global/<name>  -> XDG_DATA_HOME/ael-containers/<name>.toml
+    <name>         -> private first, then global
+    explicit path  -> that path
+    """
+    candidate = Path(expand(name))
+    if candidate.is_file():
+        return candidate
+
+    if name.startswith("private/"):
+        short = name[len("private/"):]
+        if not short:
+            fatal("Missing name after 'private/'")
+        path = _config_path(private_config_home(), short)
+        if not path.is_file():
+            fatal(f"Private container config not found: {path}")
+        return path
+
+    if name.startswith("global/"):
+        short = name[len("global/"):]
+        if not short:
+            fatal("Missing name after 'global/'")
+        path = _config_path(global_config_home(), short)
+        if not path.is_file():
+            fatal(f"Global container config not found: {path}")
+        return path
+
+    private = _config_path(private_config_home(), name)
+    if private.is_file():
+        return private
+
+    global_ = _config_path(global_config_home(), name)
+    if global_.is_file():
+        return global_
+
+    fatal(
+        f"Container config not found: {name}\n"
+        f"Checked:\n"
+        f"  {private}\n"
+        f"  {global_}\n"
+        f"Use --config PATH for an arbitrary TOML file."
+    )
+
+
+def _discover_configs():
+    """Return [(qualified_name, path)] from global and private catalogs."""
+    found = []
+
+    # Stable ordering: global catalog first, then user-owned overrides.
+    for namespace, home in (
+        ("global", global_config_home()),
+        ("private", private_config_home()),
+    ):
+        if not home.is_dir():
+            continue
+        for path in sorted(home.glob("*.toml")):
+            found.append((f"{namespace}/{path.stem}", path))
+
+    return found
+
+
+def list_containers() -> None:
+    configs = _discover_configs()
+
+    if not configs:
+        print("No container configurations found.")
+        print(f"Global : {global_config_home()}")
+        print(f"Private: {private_config_home()}")
+        return
+
+    docker_available = shutil.which("docker") is not None
+    rows = []
+
+    for qualified_name, path in configs:
+        container_name = "-"
+        status = "invalid"
+
+        try:
+            cfg = tomllib.loads(path.read_text())
+            container_name = str(cfg.get("container", {}).get("name", path.stem))
+
+            if not docker_available:
+                status = "docker-unavailable"
+            else:
+                result = subprocess.run(
+                    ["docker", "inspect", "-f", "{{.State.Status}}", container_name],
+                    text=True,
+                    capture_output=True,
+                )
+                status = result.stdout.strip() if result.returncode == 0 else "not-created"
+
+        except tomllib.TOMLDecodeError as exc:
+            status = f"invalid-toml: {exc}"
+        except OSError as exc:
+            status = f"read-error: {exc}"
+
+        rows.append((qualified_name, container_name, status))
+
+    name_w = max(len("NAME"), *(len(r[0]) for r in rows))
+    container_w = max(len("CONTAINER"), *(len(r[1]) for r in rows))
+
+    print(f"{'NAME':<{name_w}}  {'CONTAINER':<{container_w}}  STATUS")
+    print(f"{'-' * name_w}  {'-' * container_w}  {'-' * 11}")
+
+    for name, container_name, status in rows:
+        print(f"{name:<{name_w}}  {container_name:<{container_w}}  {status}")
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="AEL//Containers - TOML-driven Docker container runner",
+        epilog=(
+            "Examples:\n"
+            "  ael-containers list\n"
+            "  ael-containers stirling-pdf start\n"
+            "  ael-containers global/stirling-pdf start\n"
+            "  ael-containers private/stirling-pdf start\n"
+            "  ael-containers stirling-pdf logs -f\n"
+            "  ael-containers --config ./custom.toml start"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--config",
+        type=Path,
+        help="Use an explicit TOML configuration",
+    )
+    p.add_argument(
+        "target",
+        nargs="?",
+        help="Configured container name, TOML path, or 'list'",
+    )
+    p.add_argument("action", nargs="?", choices=ACTIONS)
+    p.add_argument("--follow", "-f", action="store_true", help="Follow logs")
+    return p
+
+
+def main() -> None:
+    args = parser().parse_args()
+
+    if args.target == "list":
+        if args.config is not None or args.action is not None:
+            fatal("'list' does not accept --config or a container action")
+        list_containers()
+        return
+
+    if args.config is not None:
+        if args.target is not None:
+            fatal("Specify either a container name or --config PATH, not both")
+        if args.action is None:
+            fatal("Missing action")
+        config_path = Path(expand(str(args.config)))
+    else:
+        if args.target is None:
+            fatal("Missing container name (or use 'list')")
+        if args.action is None:
+            fatal("Missing action")
+        config_path = resolve_config(args.target)
+
+    app = AELContainer(config_path)
+
+    if args.action == "logs":
+        app.logs(args.follow)
+    else:
+        getattr(app, args.action)()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted", file=sys.stderr)
+        raise SystemExit(130)
+    except subprocess.CalledProcessError as exc:
+        fatal(f"Command failed ({exc.returncode}): {shlex.join(map(str, exc.cmd))}", exc.returncode)

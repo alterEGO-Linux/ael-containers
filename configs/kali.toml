@@ -1,0 +1,121 @@
+# =============================================================================
+# INFO
+# =============================================================================
+# [/ael-containers/configs/kali.toml]
+# 
+# Author      : Pascal Malouin (https://github.com/alterEGO-Linux)
+# Created     : 2026-09-30 18:27:49 UTC
+# Updated     : 2026-09-30 18:27:49 UTC
+# Description : kali-on-ael
+#
+# ---( IMPORTANT )-------------------------------------------------------------
+#
+# All configuration files in $HOME/.local/share/ael-containers/ are subject to
+# be overwritten by any updates.
+# Copy this file to $HOME/.config/ael-containers/ if you wish to modify it.
+# -----------------------------------------------------------------------------
+[meta]
+name = "Kali Linux"
+description = "Persistent Kali XFCE desktop exposed through VNC."
+
+[container]
+name = "kali-on-ael"
+image = "ael/kali-vnc:latest"
+hostname = "kali"
+restart = "unless-stopped"
+
+[[container.ports]]
+host = 5900
+container = 5900
+
+[container.environment]
+AEL_USER = "kali"
+DISPLAY = ":0"
+WIDTH = "1280"
+HEIGHT = "800"
+DEPTH = "24"
+
+[build]
+tag = "ael/kali-vnc:latest"
+dockerfile = "Dockerfile"
+
+[build.args]
+BASE_IMAGE = "kalilinux/kali-rolling"
+USERNAME = "kali"
+PASSWORD = "kali"
+EXTRA_PACKAGES = "curl wget vim firefox-esr"
+
+[[build.files]]
+path = "Dockerfile"
+content = '''
+ARG BASE_IMAGE=kalilinux/kali-rolling
+FROM ${BASE_IMAGE}
+
+ARG USERNAME=kali
+ARG PASSWORD=kali
+ARG EXTRA_PACKAGES=""
+ENV DEBIAN_FRONTEND=noninteractive
+ENV DISPLAY=:0
+
+RUN apt update \
+    && apt install -y xfce4 xfce4-goodies x11vnc xvfb dbus-x11 sudo procps net-tools ${EXTRA_PACKAGES} \
+    && apt clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash "${USERNAME}" \
+    && echo "${USERNAME}:${PASSWORD}" | chpasswd \
+    && usermod -aG sudo "${USERNAME}" \
+    && mkdir -p "/home/${USERNAME}/.vnc" \
+    && x11vnc -storepasswd "${PASSWORD}" "/home/${USERNAME}/.vnc/passwd" \
+    && chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}"
+
+COPY --chmod=0755 start.sh /usr/local/bin/ael-container-start
+EXPOSE 5900
+CMD ["/usr/local/bin/ael-container-start"]
+'''
+
+[[build.files]]
+path = "start.sh"
+mode = "0755"
+content = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+AEL_USER="${AEL_USER:-kali}"
+WIDTH="${WIDTH:-1280}"
+HEIGHT="${HEIGHT:-800}"
+DEPTH="${DEPTH:-24}"
+export DISPLAY="${DISPLAY:-:0}"
+export HOME="/home/${AEL_USER}"
+export XDG_RUNTIME_DIR="/tmp/runtime-${AEL_USER}"
+
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+rm -f /tmp/.X0-lock
+
+Xvfb "$DISPLAY" -screen 0 "${WIDTH}x${HEIGHT}x${DEPTH}" -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
+XVFB_PID=$!
+sleep 2
+kill -0 "$XVFB_PID" 2>/dev/null || { cat /tmp/xvfb.log; exit 1; }
+
+dbus-launch --exit-with-session startxfce4 >/tmp/xfce.log 2>&1 &
+sleep 3
+
+exec x11vnc -display "$DISPLAY" -forever -shared -rfbport 5900 -rfbauth "$HOME/.vnc/passwd"
+'''
+
+[open]
+type = "command"
+command = ["vncviewer", "127.0.0.1:5900"]
+wait_for_health = true
+
+[health]
+type = "tcp"
+host = "127.0.0.1"
+port = 5900
+timeout = 60
+interval = 0.5
+
+[shell]
+command = ["/bin/bash"]
+user = "kali"

@@ -1,0 +1,39 @@
+# =============================================================================
+# INFO
+# =============================================================================
+# [/ael-containers/configs/cyberchef.toml]
+# 
+# Author      : Pascal Malouin (https://github.com/alterEGO-Linux)
+# Created     : 2026-09-30 18:27:49 UTC
+# Updated     : 2026-09-30 18:27:49 UTC
+# Description : cyberchef-on-ael
+#
+# ---( IMPORTANT )-------------------------------------------------------------
+#
+# All configuration files in $HOME/.local/share/ael-containers/ are subject to
+# be overwritten by any updates.
+# Copy this file to $HOME/.config/ael-containers/ if you wish to modify it.
+# -----------------------------------------------------------------------------
+
+[container]
+name = "cyberchef-on-ael"
+image = "mpepping/cyberchef"
+restart = "unless-stopped"
+
+[[container.ports]]
+host = 8888
+container = 8000
+
+[open]
+type = "browser"
+url = "http://localhost:8888"
+wait_for_health = true
+
+[health]
+type = "http"
+url = "http://localhost:8888"
+timeout = 30
+interval = 0.2
+
+[shell]
+command = ["/bin/sh"]
