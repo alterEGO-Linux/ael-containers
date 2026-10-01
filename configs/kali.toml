@@ -66,10 +66,17 @@ RUN useradd -m -s /bin/bash "${USERNAME}" \
     && echo "${USERNAME}:${PASSWORD}" | chpasswd \
     && usermod -aG sudo "${USERNAME}" \
     && mkdir -p "/home/${USERNAME}/.vnc" \
+    && mkdir -p "/tmp/runtime-${USERNAME}" \
+    && chmod 700 "/tmp/runtime-${USERNAME}" \
     && x11vnc -storepasswd "${PASSWORD}" "/home/${USERNAME}/.vnc/passwd" \
-    && chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}"
+    && chown -R "${USERNAME}:${USERNAME}" "/home/${USERNAME}" \
+    && chown "${USERNAME}:${USERNAME}" "/tmp/runtime-${USERNAME}"
 
 COPY --chmod=0755 start.sh /usr/local/bin/ael-container-start
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+
 EXPOSE 5900
 CMD ["/usr/local/bin/ael-container-start"]
 '''
